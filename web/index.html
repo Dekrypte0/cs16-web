@@ -29,6 +29,22 @@
     </script>
 
     <script>
+        // ---- Join card: never reload the page ----
+        // The card is a plain <form>; if the engine's own submit handler does not
+        // call preventDefault (or errors out first) the browser performs a native
+        // GET submit, which reloads the page. To the player that looks exactly
+        // like "it kicked me back to the menu". BUBBLE phase on purpose: the
+        // engine's own submit handler runs first (it starts the game), and only
+        // the browser's default navigation is canceled afterwards — so this can
+        // never stop the engine from booting.
+        document.addEventListener('submit', function (e) {
+            if (e.target && (e.target.id === 'form' || (e.target.tagName === 'FORM' && e.target.querySelector('#username')))) {
+                e.preventDefault();
+            }
+        }, false);
+    </script>
+
+    <script>
         // ---- In-browser map picker ----
         // Lives in <head> and self-heals (re-injects on a tick) so it survives
         // any rebuild of <body>. Switches the server map for everyone via
@@ -134,7 +150,7 @@
                 btn.textContent = 'Maps';
                 btn.title = 'Choose a map';
                 btn.setAttribute('aria-haspopup', 'dialog');
-                css(btn, { position: 'fixed', top: '10px', left: '50%', transform: 'translateX(-50%)',
+                css(btn, { position: 'fixed', top: '10px', left: '10px', transform: 'none',
                     zIndex: 2147483646, display: 'none', padding: '8px 18px', background: '#000000cc',
                     color: '#f6b265', border: '1px solid #f6b265', borderRadius: '999px',
                     font: '600 13px Arial, sans-serif', letterSpacing: '.3px', cursor: 'pointer' });
@@ -692,6 +708,11 @@
 
         audio { display: none; }
     </style>
+  <!-- Join layer: must load BEFORE the engine bundle. It makes the browser
+       actually join the dedicated server (instead of silently dumping the
+       player in Counter-Strike's own main menu), retries, explains failures,
+       and offers an offline bot game. Classic script: no import/export. -->
+  <script src="/join.js"></script>
   <script type="module" crossorigin src="/assets/main-Sj92UznW.js"></script>
 </head>
 <body>

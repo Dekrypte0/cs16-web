@@ -1,10 +1,10 @@
 {
   "name": "cs16-web",
-  "version": "1.0.0",
-  "description": "",
+  "version": "1.1.0",
+  "description": "Counter-Strike 1.6 playable in the browser over LAN (WebRTC + Xash3D WASM)",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test-join.js"
   },
   "keywords": [],
   "author": "",
@@ -13,5 +13,8 @@
   "dependencies": {
     "playwright": "^1.60.0",
     "xash3d-fwgs": "^1.2.2"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1"
   }
 }

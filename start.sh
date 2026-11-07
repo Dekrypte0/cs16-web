@@ -40,12 +40,31 @@ if ! docker info >/dev/null 2>&1; then
   until docker info >/dev/null 2>&1; do sleep 2; done
 fi
 
-# First run: build the patched in-browser client (map picker + Esc fix).
-if [ ! -f web/main.js ]; then
-  echo "Preparing patched web client..."
-  ./prepare-client.sh
+# First run (or after a failed/missing extraction): build the patched in-browser
+# client. web/main.js is generated (gitignored) and carries the window.__xash
+# hook that web/join.js needs to join the server at all — without it the browser
+# silently lands on Counter-Strike's own main menu. So a missing bundle is not a
+# cosmetic problem: always (re)build it before starting the containers.
+if [ ! -f web/main.js ] || [ ! -s web/main.js ]; then
+  echo "Preparing patched web client (needed to join the server)..."
+  if ! ./prepare-client.sh; then
+    echo "✗ could not generate web/main.js."
+    echo "  The page will load, but browsers cannot join the server (they will"
+    echo "  sit on Counter-Strike's main menu). Check Docker and re-run ./start.sh."
+    exit 1
+  fi
   CHANGED=1
 fi
+
+# The join layer is hand-written (not generated) — fail early if it is missing,
+# because that is the code that connects the browser to this server.
+for f in web/join.js web/index.html; do
+  if [ ! -s "$f" ]; then
+    echo "✗ $f is missing — the browser client cannot work without it."
+    echo "  Restore it from git (git checkout -- $f) and re-run ./start.sh."
+    exit 1
+  fi
+done
 
 # First run: build the game assets (valve.zip) if absent. It is NOT in the repo
 # (Valve's copyrighted content + ~400 MB > GitHub's file limit), so a fresh clone
@@ -163,5 +182,9 @@ echo ""
 echo "  Share this link with your team:$CLIP"
 echo ""
 echo "      $URL"
+echo ""
+echo "  Not connecting / landing on the CS main menu? Open"
+echo "      $URL/?debug=1"
+echo "  for an on-screen connection log, or press F8 in-game."
 echo ""
 echo "  Stop the server: ./stop.sh"

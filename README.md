@@ -75,6 +75,48 @@ Stop the server: `./stop.sh`. Live logs: `docker logs -f cs16-web`.
 
 Recommended: 16-player default; pick the map from the in-browser picker once people join.
 
+## "It loads, then drops me in the CS main menu"
+
+That is the classic symptom of a browser that booted the engine fine but could
+**not reach the dedicated server**: the engine falls back to its own
+Counter-Strike main menu and says nothing. Since v1.1 the page ships a **join
+layer** (`web/join.js`) that removes the guesswork:
+
+- it issues `connect <host:27018>` for you once the engine is up, and **retries**
+  (3 attempts, 20 s each),
+- it **classifies the engine log**, so a dead connection produces a readable card
+  ("Could not join the game server", the address it tried, what to check) instead
+  of a silent menu,
+- it can start an **offline game with bots** so you can still play while you fix
+  the network,
+- it keeps a **connection log**: open `http://<host>:27016/?debug=1`, or press
+  **F8** at any time, and use *Copy log* when asking for help.
+
+Quick checklist for a join that keeps failing:
+
+1. Host is running `./start.sh` (both containers: `cs16-web` and `cs16-proxy`).
+2. Players are on the **same LAN** — guest/AP-isolated Wi-Fi blocks WebRTC.
+3. Host firewall allows TCP `27016` and TCP/UDP `27018`.
+4. The `IP:` in `docker-compose.yml` is the host's **current** LAN IP (re-run
+   `./start.sh` after a network change — it rewrites it).
+5. Try `http://<host>:27016/?connect=<host-ip>:27018` to point a client at a
+   specific address (handy when the page is reached via a different hostname,
+   e.g. a reverse proxy or a VPN IP).
+
+Useful URL options (all optional):
+
+| Option | Effect |
+|---|---|
+| `?connect=<ip[:port]>` | server to join (default: page host, port 27018) |
+| `?connect=0` | do not auto-join; stay on the menu |
+| `?name=<nick>` | prefill the player name |
+| `?bots=1&map=de_dust2&difficulty=2&quota=9` | start an offline bot game |
+| `?debug=1` | open the connection log immediately |
+| `?joinTimeout=<ms>&joinAttempts=<n>` | tune the retry behaviour on a slow LAN |
+
+The join layer is covered by a headless test — `node test-join.js` (needs
+`npm i`, uses jsdom only as a dev dependency).
+
 ## Changing the map
 
 **From the browser (recommended).** While playing, press **Esc** to free the mouse,
@@ -117,8 +159,16 @@ never modified:
   build (its TTF fonts are missing), so we suppress it; the browser still releases the
   mouse, which reveals the map picker instead. The picker lives in `<head>` and
   self-heals, because the engine rebuilds `<body>` on load.
-- **`web/main.js`** — **generated** by `./prepare-client.sh`; a one-line patch exposing
-  the engine instance on `window.__xash` so the picker can call `rcon changelevel`.
+- **`web/main.js`** — **generated** by `./prepare-client.sh` (patches applied by
+  `patch-main.pl`); it exposes the engine instance on `window.__xash` so the map
+  picker and the join layer can run engine commands.
+- **`web/join.js`** — the join layer. Loaded *before* the engine bundle; joins the
+  server, retries, explains failures, offers offline bots and keeps the F8 log.
+  Everything it does is feature-detected, so if it cannot talk to the engine the
+  page behaves exactly as before.
+- **`web/vendor/`** — the engine's `extras.pk3` (fonts, menu/touch assets; the
+  pinned image does not ship it) and JSZip, both content-addressed/versioned and
+  served `immutable` by the proxy so they cost nothing after the first visit.
 - **`proxy/nginx.conf`** — a small nginx reverse-proxy sidecar (added in `docker-compose.yml`)
   that owns the public port `27016` and forwards to the game container internally. It injects
   the HTTP caching headers the in-image server can't — `immutable` for the content-hashed
@@ -170,7 +220,11 @@ add-maps.sh            # download custom maps into valve.zip + custom-maps/
 proxy/nginx.conf       # caching reverse-proxy (owns :27016, /websocket passthrough)
 cstrike/server.cfg     # full-money arsenal + RCON password for the map picker
 web/index.html         # patched client page: join UI + loading + map picker + Esc handling
+web/join.js            # join layer: connect + retry + readable errors + bots + F8 log
+web/vendor/            # engine extras.pk3 (fonts/menu) + JSZip, served with long caching
 web/main.js            # generated, gitignored (run prepare-client.sh)
+patch-main.pl          # applies the (tiny) bundle patches; run via prepare-client.sh
+test-join.js           # headless tests for web/join.js (node test-join.js)
 custom-maps/*.bsp      # bundled custom maps, committed (mounted into the server)
 valve.zip              # game content, gitignored (rebuild via SteamCMD)
 docs/img/              # screenshots

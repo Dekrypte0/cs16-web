@@ -18,6 +18,13 @@ services:
       # patched in-browser client: map picker + Esc fix + exposed engine handle
       - "./web/index.html:/xashds/public/index.html"
       - "./web/main.js:/xashds/public/assets/main-Sj92UznW.js"
+      # join layer: makes the browser actually join this server (retries +
+      # readable errors + offline bot fallback) instead of silently falling back
+      # to Counter-Strike's own main menu. Loaded before the bundle.
+      - "./web/join.js:/xashds/public/join.js"
+      # engine extras (fonts/menu assets the image omits) + JSZip, served with
+      # immutable caching by the proxy
+      - "./web/vendor:/xashds/public/vendor:ro"
       # server config: full-money arsenal + rcon for the map picker
       - "./cstrike/server.cfg:/xashds/cstrike/server.cfg"
       # custom maps (server side; clients get them from valve.zip)
