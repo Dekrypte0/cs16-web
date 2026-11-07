@@ -70,13 +70,30 @@
     // Delay before the next attempt (?joinRetry=ms).
     var RETRY_DELAY_MS = posInt(q('joinRetry'), 1500);
 
+    // Once the "give up" card has been shown, keep trying in the background so
+    // a server that comes back later still picks the player up — but slowly,
+    // so a genuinely broken setup is not hammered (?joinIdle=ms).
+    var IDLE_RETRY_MS = posInt(q('joinIdle'), 12000);
+
+    // While connected, the player should never be dumped on the menu because of
+    // one hiccup: retry a dropped connection, then fall back to the periodic
+    // background retry (?joinDrop=<n>).
+    var DROP_RETRIES = posInt(q('joinDrop'), 3);
+
+    // Watchdog: if the engine stops responding to our `status` probes while we
+    // are supposed to be connected, treat it as a dead join (not just a hiccup).
+    var STALL_MS = posInt(q('joinStall'), 45000);
+    var PROBE_MS = posInt(q('joinProbe'), 8000);
+
     // Engine console lines that mean "the join worked".
     var RE_OK = /(connection accepted|serverinfo|server info|loading map|spawn server|hostname:|connected to|"connected")/i;
     // Engine console lines that mean "this attempt failed".
     var RE_FAIL = /(server not responding|remote host|connection timed out|could ?n[o']t connect|no route to host|net_sendpacket.*(fail|error)|net_queuepacket.*error|bad address|invalid address|host_error|disconnected)/i;
+    // Console lines that mean "we were in, and now we are not".
+    var RE_DROP = /(server shutting down|disconnected|connection (to|was) (the )?(server )?(lost|closed|reset)|reconnect|net_sendpacket.*error|host_error)/i;
 
     function loadCfg() {
-        var cfg = { name: '', server: '', autoConnect: true };
+        var cfg = { name: '', server: '', autoConnect: true, explicit: false };
         try {
             var raw = localStorage.getItem(STORE_CFG);
             if (raw) {
@@ -84,6 +101,7 @@
                 if (parsed && typeof parsed === 'object') {
                     if (typeof parsed.name === 'string') cfg.name = parsed.name;
                     if (typeof parsed.server === 'string') cfg.server = parsed.server;
+                    if (typeof parsed.explicit === 'boolean') cfg.explicit = parsed.explicit;
                     if (typeof parsed.autoConnect === 'boolean') cfg.autoConnect = parsed.autoConnect;
                 }
             }
@@ -96,6 +114,30 @@
 
     var cfg = loadCfg();
 
+    // Are we playing on the machine that also runs the server? Then the server
+    // is reachable on loopback even if this box is not on the LAN (Wi-Fi down,
+    // AP isolation, a fresh clone with the compose default IP, ...).
+    function isLocalHost() {
+        var h = (location.hostname || '').toLowerCase();
+        return h === 'localhost' || h === '::1' || h === '[::1]' ||
+               h === '127.0.0.1' || /^127\./.test(h);
+    }
+
+    // Try these in order until one joins. Loopback first on the host itself.
+    function candidateServers() {
+        var list = [];
+        var auto = defaultServer();
+        function add(a) { if (a && list.indexOf(a) === -1) list.push(a); }
+        // An address the player chose (URL or the field) always comes first —
+        // never silently override an explicit choice. Otherwise, on the server
+        // machine itself, loopback is the most likely one to work.
+        if (cfg.explicit) add(cfg.server);
+        if (isLocalHost()) add('127.0.0.1:' + DEFAULT_PORT);
+        add(cfg.server);
+        add(auto);
+        return list;
+    }
+
     // Default server: the page host IS the machine running the WebRTC bridge
     // (nginx proxy + game container), so this is right for LAN players too.
     function defaultServer() {
@@ -106,6 +148,7 @@
     var urlServer = q('connect');
     if (urlServer !== undefined && String(urlServer).trim() !== '' && truthy(urlServer)) {
         cfg.server = normaliseAddr(urlServer);
+        cfg.explicit = true;
     }
     if (q('name') !== undefined) cfg.name = String(q('name')).slice(0, 24);
     var autoConnectParam = q('connect');
@@ -233,6 +276,7 @@
         var ul = el('ul', {}, { margin: '0 0 16px', paddingLeft: '18px', fontSize: '13px', lineHeight: '1.8', color: '#cfcfcf' });
         [
             'The host must be running <b>./start.sh</b> (or the two Docker containers).',
+            'This page keeps retrying in the background, so it joins as soon as the server answers.',
             'Everyone must be on the <b>same Wi-Fi/LAN</b>; guest or AP-isolated Wi-Fi blocks WebRTC.',
             'Allow inbound TCP <b>27016</b> and TCP/UDP <b>27018</b> on the host firewall.',
             'If the host\u2019s IP changed, re-run <b>./start.sh</b> so the container advertises the new IP.'
@@ -276,6 +320,11 @@
         panel.appendChild(row);
         overlay.appendChild(panel);
         (document.body || document.documentElement).appendChild(overlay);
+    }
+
+    function hideTrouble() {
+        var old = document.getElementById('cs-joinhelp');
+        if (old && old.parentNode) old.parentNode.removeChild(old);
     }
 
     function escapeHtml(s) {
@@ -331,26 +380,44 @@
     // Join state machine
     // ---------------------------------------------------------------------
     var state = {
-        phase: 'idle',      // idle | waiting-engine | connecting | connected | failed | bots
+        // idle | waiting-engine | connecting | connected | failed | bots
+        phase: 'idle',
         attempt: 0,
-        timer: null,
+        timer: null,        // pending state-machine step (timeout / retry)
+        probeTimer: null,   // periodic "are we still in?" probe
         cmdAt: 0,
-        lastReason: ''
+        lastReason: '',
+        connectedAt: 0,
+        lastProbeAt: 0,     // last time we asked the engine for `status`
+        lastAliveAt: 0,     // last time the engine said anything while connected
+        dropRetries: 0,
+        connects: 0,
+        probes: 0
     };
 
     function clearTimer() {
         if (state.timer) { clearTimeout(state.timer); state.timer = null; }
     }
+    function clearProbe() {
+        if (state.probeTimer) { clearInterval(state.probeTimer); state.probeTimer = null; }
+    }
 
     function resetJoin() {
         clearTimer();
+        clearProbe();
         state.phase = 'idle';
         state.attempt = 0;
         state.lastReason = '';
+        state.dropRetries = 0;
     }
 
     function onEngineLine(line) {
         logLine(line);
+
+        // Any engine output while connected proves the engine (and usually the
+        // connection) is alive; the watchdog below reads lastAliveAt.
+        if (state.phase === 'connected') state.lastAliveAt = Date.now();
+
         // The engine echoes the command we just typed ("> connect 1.2.3.4:5").
         // Ignore exactly that echo briefly, instead of ignoring *everything*
         // for a moment — otherwise a fast real answer would be dropped too.
@@ -359,20 +426,85 @@
             echoed.length < 64 && /^(disconnect|connect)\b/i.test(echoed)) {
             return;
         }
-        if (state.phase !== 'connecting') return;
-        if (RE_OK.test(line)) {
-            markConnected(line);
-        } else if (RE_FAIL.test(line)) {
-            state.lastReason = line;
-            scheduleRetry(400);
+
+        if (state.phase === 'connecting') {
+            if (RE_OK.test(line)) {
+                markConnected(line);
+            } else if (RE_FAIL.test(line)) {
+                state.lastReason = line;
+                scheduleRetry(400);
+            }
+            return;
+        }
+
+        // Dropped mid-game: an hour of play must survive a hiccup, so retry
+        // quietly instead of surfacing the card (the player is in-game and
+        // would only see a flash of the menu).
+        if (state.phase === 'connected' && RE_DROP.test(line)) {
+            onDropped(line);
         }
     }
 
-    function markConnected() {
+    function markConnected(why) {
         clearTimer();
+        clearProbe();
         state.phase = 'connected';
+        state.connectedAt = Date.now();
+        state.lastAliveAt = Date.now();
+        state.dropRetries = 0;
         setStatus('Connected to ' + cfg.server, false);
-        logLine('join OK', 'info');
+        logLine('join OK' + (why ? ' (' + why + ')' : ''), 'info');
+        startProbe();
+        hideTrouble();
+        renderStateCard();
+    }
+
+    function onDropped(why) {
+        if (state.dropRetries >= DROP_RETRIES) {
+            // Out of quiet retries: this is a real outage. Keep the periodic
+            // background retry alive so a server restart still reconnects.
+            state.phase = 'failed';
+            state.lastReason = why;
+            logLine('connection lost; giving up after ' + state.dropRetries + ' quiet retries', 'warn');
+            renderStateCard();
+            setStatus('Disconnected from ' + cfg.server + ' — retrying in background', true);
+            scheduleIdleRetry();
+            return;
+        }
+        state.dropRetries += 1;
+        state.lastReason = why;
+        logLine('connection lost (' + why + ') — quick retry ' + state.dropRetries + '/' + DROP_RETRIES, 'warn');
+        setStatus('Connection lost — reconnecting (' + state.dropRetries + '/' + DROP_RETRIES + ')', true);
+        clearProbe();
+        state.phase = 'connecting';
+        state.attempt = 1;
+        scheduleRetry(600);
+    }
+
+    // Ask the engine, periodically, whether we are still in the game. The
+    // engine answers `status` with a printable player list, which also keeps
+    // lastAliveAt fresh; silence for STALL_MS means the join went away without
+    // the engine saying so (e.g. the packet channel collapsed).
+    function startProbe() {
+        clearProbe();
+        state.lastProbeAt = Date.now();
+        state.probeTimer = setInterval(function () {
+            if (state.phase !== 'connected') return;
+            var now = Date.now();
+            // Only probe when the engine has been quiet for a while, so we do
+            // not interleave our commands with gameplay chat spam.
+            if (now - state.lastAliveAt < STALL_MS / 2) return;
+            state.lastProbeAt = now;
+            state.probes += 1;
+            exec('status');
+            setTimeout(function () {
+                if (state.phase !== 'connected') return;
+                if (Date.now() - state.lastAliveAt > STALL_MS) {
+                    onDropped('engine stopped answering (no reply for ' +
+                        Math.round(STALL_MS / 1000) + 's)');
+                }
+            }, 4000);
+        }, PROBE_MS);
     }
 
     // Wait for the engine main loop, then act.
@@ -394,6 +526,95 @@
             }
             state.timer = setTimeout(poll, 250);
         })();
+    }
+
+    // --- "this machine is the server" -------------------------------------
+    // The host almost always wants to play too, and a fresh clone has the
+    // compose IP set to a placeholder. One click starts a local game that needs
+    // no WebRTC/LAN at all, so there is always something to play immediately.
+    function addLocalCard(form) {
+        if (!isLocalHost() || form.querySelector('.cs-local')) return;
+
+        var box = el('div', { className: 'cs-local' }, {
+            borderTop: '1px solid #2a2a2a', paddingTop: '12px',
+            display: 'flex', flexDirection: 'column', gap: '8px'
+        });
+        box.appendChild(el('div', { textContent: 'Running on the server machine?' }, {
+            fontSize: '12px', color: '#9aa0a6', fontWeight: '600'
+        }));
+
+        var local = el('button', {
+            type: 'button',
+            textContent: '▶ Start a local game (no network needed)'
+        }, {
+            width: '100%', padding: '11px 14px', background: 'transparent',
+            color: '#f6b265', border: '1px solid #f6b265', borderRadius: '10px',
+            font: '700 14px Arial, Helvetica, sans-serif', cursor: 'pointer'
+        });
+        local.onclick = function () {
+            var map = (q('map') || 'de_dust2');
+            local.textContent = 'Starting ' + map + '…';
+            logLine('local game requested (map ' + map + ')', 'info');
+            startBots();
+        };
+        box.appendChild(local);
+        box.appendChild(el('div', { textContent:
+            'Bots only, on this machine — ideal for a solo test. To play with ' +
+            'friends on the Wi-Fi, use Start below.'
+        }, { fontSize: '11.5px', color: '#6b7075', lineHeight: '1.5' }));
+
+        var submit = form.querySelector('button[type="submit"]');
+        form.insertBefore(box, submit || null);
+    }
+
+    // One-line status card: tells the player in plain words what is happening,
+    // plus a button to change the server without digging through the console.
+    function addStateCard(form) {
+        if (form.querySelector('.cs-statecard')) return;
+        var box = el('div', { className: 'cs-statecard', id: 'cs-statecard' }, {
+            borderTop: '1px solid #2a2a2a', paddingTop: '12px',
+            display: 'flex', flexDirection: 'column', gap: '8px'
+        });
+        var submit = form.querySelector('button[type="submit"]');
+        form.insertBefore(box, submit || null);
+        renderStateCard();
+    }
+
+    function renderStateCard() {
+        var box = document.getElementById('cs-statecard');
+        if (!box) return;
+        var map = { idle: 'Ready.', waiting: 'Starting the engine…',
+            connecting: 'Joining the server…', connected: 'Connected.',
+            failed: 'Not connected.', bots: 'Local game' };
+        var label = map[state.phase] || '';
+        box.innerHTML = '';
+
+        var row = el('div', {}, {
+            display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12.5px',
+            color: state.phase === 'failed' ? '#f0a0a0' : '#9aa0a6'
+        });
+        var dot = el('span', {}, {
+            width: '8px', height: '8px', borderRadius: '50%', flex: '0 0 auto',
+            background: state.phase === 'connected' ? '#67c07a'
+                      : state.phase === 'failed' ? '#c06352'
+                      : state.phase === 'connecting' ? '#f6b265' : '#5f6368'
+        });
+        row.appendChild(dot);
+        row.appendChild(el('span', { textContent: label + ' (' + cfg.server + ')' }, {
+            flex: '1 1 auto', minWidth: '0', overflow: 'hidden', textOverflow: 'ellipsis'
+        }));
+        var edit = el('button', { type: 'button', textContent: 'Change' }, {
+            background: 'none', border: 'none', color: '#f6b265', cursor: 'pointer',
+            fontSize: '12.5px', textDecoration: 'underline', padding: '0'
+        });
+        edit.onclick = function () {
+            var f = document.getElementById('form');
+            if (f && f.style.display === 'none') f.style.display = '';
+            var inputEl = document.getElementById('cs-server-input');
+            if (inputEl) { try { inputEl.focus(); inputEl.select(); } catch (e) {} }
+        };
+        row.appendChild(edit);
+        box.appendChild(row);
     }
 
     function startJoin() {
@@ -420,19 +641,31 @@
 
         if (state.attempt > MAX_ATTEMPTS) {
             state.phase = 'failed';
-            showTrouble(state.lastReason || 'no response from the server');
+            state.lastReason = state.lastReason || 'no response from the server';
+            setStatus('Could not reach ' + cfg.server + ' — retrying in background', true);
+            showTrouble(state.lastReason);
+            scheduleIdleRetry();
             return;
         }
 
-        setStatus('Joining ' + cfg.server + ' \u2014 attempt ' + state.attempt + '/' + MAX_ATTEMPTS, true);
-        logLine('connect attempt ' + state.attempt + ' -> ' + cfg.server, 'info');
+        // Round 1 uses the configured address; later rounds also try the other
+        // candidates (loopback when this IS the server, the page's own host).
+        // That covers the two classic misconfigurations with no user action.
+        var candidates = candidateServers();
+        var target = candidates[(state.attempt - 1) % candidates.length] || cfg.server;
+
+        setStatus('Joining ' + target + ' \u2014 attempt ' + state.attempt + '/' + MAX_ATTEMPTS, true);
+        logLine('connect attempt ' + state.attempt + '/' + MAX_ATTEMPTS + ' -> ' + target, 'info');
 
         if (state.attempt > 1) exec('disconnect');
-        if (!exec('connect ' + cfg.server)) {
+        state.connects += 1;
+        if (!exec('connect ' + target)) {
             state.phase = 'failed';
-            showTrouble('the engine console is not available (window.__xash missing)');
+            showTrouble('the engine console is not available (window.__xash is missing) ' +
+                '\u2014 regenerate the client bundle with ./prepare-client.sh');
             return;
         }
+        renderStateCard();
 
         state.timer = setTimeout(function () {
             if (state.phase !== 'connecting') return;
@@ -446,6 +679,20 @@
         state.timer = setTimeout(function () {
             if (state.phase === 'connecting') attemptJoin();
         }, ms || RETRY_DELAY_MS);
+    }
+
+    // Slow, endless retry used after the card has been shown: if the player
+    // leaves the tab open, a server that comes back (host restarted ./start.sh,
+    // laptop rejoined the Wi-Fi, ...) still gets them into the game.
+    function scheduleIdleRetry() {
+        clearTimer();
+        state.timer = setTimeout(function () {
+            if (state.phase !== 'failed') return;
+            if (!engine() || !engine().running) { scheduleIdleRetry(); return; }
+            logLine('background retry', 'info');
+            state.attempt = 0;
+            attemptJoin();
+        }, IDLE_RETRY_MS);
     }
 
     // ---------------------------------------------------------------------
@@ -508,7 +755,12 @@
             font: '15px Arial, sans-serif', outline: 'none'
         });
         input.oninput = function () { cfg.server = input.value; };
-        input.onblur = function () { cfg.server = normaliseAddr(input.value); input.value = cfg.server; saveCfg(); };
+        input.onblur = function () {
+            cfg.server = normaliseAddr(input.value);
+            input.value = cfg.server;
+            cfg.explicit = true;
+            saveCfg();
+        };
 
         var autoRow = el('label', {}, {
             display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12.5px',
@@ -541,6 +793,8 @@
         var submit = form.querySelector('button[type="submit"]') || form.lastChild;
         form.insertBefore(box, submit);
         form.insertBefore(links, submit);
+        addStateCard(form);
+        addLocalCard(form);
 
         // Capture the name on submit; the engine's own handler starts the game.
         if (!form.__csHooked) {
@@ -661,6 +915,7 @@
         }
         // While the engine is running and we are mid-join, keep the status
         // strip out of the way of gameplay.
+        renderStateCard();
         var s = document.getElementById('cs-joinstatus');
         if (s && s.style.display !== 'none' && document.pointerLockElement) s.style.display = 'none';
     }

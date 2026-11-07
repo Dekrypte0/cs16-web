@@ -113,9 +113,50 @@ Useful URL options (all optional):
 | `?bots=1&map=de_dust2&difficulty=2&quota=9` | start an offline bot game |
 | `?debug=1` | open the connection log immediately |
 | `?joinTimeout=<ms>&joinAttempts=<n>` | tune the retry behaviour on a slow LAN |
+| `?joinDrop=<n>&joinIdle=<ms>` | quiet reconnects after a dropped connection, then background retries |
+| `?joinProbe=<ms>&joinStall=<ms>` | engine watchdog sensitivity |
 
-The join layer is covered by a headless test — `node test-join.js` (needs
-`npm i`, uses jsdom only as a dev dependency).
+Both test suites run with one command:
+
+```bash
+npm test          # = node test-join.js && ./test-ops.sh
+```
+
+- `test-join.js` — 62 assertions against the real `web/join.js` in jsdom, with a
+  simulated engine: address normalisation, connect/retry/exhaustion, drops and
+  recovery, the engine watchdog, bot mode, persistence, and "no engine at all".
+  jsdom is a dev dependency only.
+- `test-ops.sh` — runs `start.sh`, `status.sh`, `doctor.sh`, `watchdog.sh` and
+  `stop.sh` against a **stub `docker`**, so it verifies the launcher logic
+  (detached watchdog, no double-start, recovery decisions, pid handling) on a
+  machine without Docker.
+
+## Leaving it running unattended
+
+The stack is built to survive a long session with nobody at the keyboard:
+
+| Piece | What it does |
+|---|---|
+| `./watchdog.sh` (started by `./start.sh`) | Probes `:27016` every 20 s. Three failures in a row (~1 min) and it recovers by itself: dead container → `docker compose up -d`, wedged container → `docker restart cs16-web`. Log: `watchdog.log`. |
+| Browser join layer | Re-joins on its own: if the connection drops mid-game it retries quietly (3×), then keeps retrying every 12 s in the background — so a host who restarts the server still gets everyone back in. |
+| Engine watchdog | If the engine stops answering for 45 s while "connected", the player is quietly re-joined instead of sitting on a dead server. |
+| nginx offline page | While the game container restarts, players get a friendly "starting…" page that reloads itself every 5 s instead of a bare 502. |
+
+Useful commands after an hour away:
+
+```bash
+./status.sh     # one screen: containers, endpoints, share link, watchdog, last joins
+./doctor.sh     # "why can't I join?" — checks every link and prints the fix
+tail -f watchdog.log
+```
+
+Stop everything (including the watchdog): `./stop.sh`.
+
+### Playing alone (no Wi-Fi at all)
+
+Open the link and click **▶ Start a local game (no network needed)** — bots on
+`de_dust2`, no WebRTC involved. Great for checking that your client and assets
+are healthy before blaming the network.
 
 ## Changing the map
 
@@ -224,7 +265,11 @@ web/join.js            # join layer: connect + retry + readable errors + bots + 
 web/vendor/            # engine extras.pk3 (fonts/menu) + JSZip, served with long caching
 web/main.js            # generated, gitignored (run prepare-client.sh)
 patch-main.pl          # applies the (tiny) bundle patches; run via prepare-client.sh
-test-join.js           # headless tests for web/join.js (node test-join.js)
+watchdog.sh            # auto-recovery loop, started by start.sh (log: watchdog.log)
+status.sh              # one-screen health report        (npm run status)
+doctor.sh              # "why can't I join?" diagnosis
+test-join.js           # headless tests for web/join.js   (npm test)
+test-ops.sh            # ops-script tests via a stub docker (npm test)
 custom-maps/*.bsp      # bundled custom maps, committed (mounted into the server)
 valve.zip              # game content, gitignored (rebuild via SteamCMD)
 docs/img/              # screenshots

@@ -58,7 +58,7 @@ function makeEngine(behavior) {
  *  engine      — the simulated client, or null to simulate "engine never boots"
  *  storage     — initial localStorage contents
  */
-async function boot({ url = '/', engine = null, storage = {}, form = true } = {}) {
+async function boot({ url = '/', engine = null, storage = {}, form = true, host = '192.168.1.50:27016' } = {}) {
   const dom = new JSDOM(
     `<!DOCTYPE html><html><head></head><body>
        ${form ? `<form id="form">
@@ -70,7 +70,7 @@ async function boot({ url = '/', engine = null, storage = {}, form = true } = {}
        <canvas id="canvas"></canvas>
      </body></html>`,
     {
-      url: 'http://192.168.1.50:27016' + url,
+      url: 'http://' + host + url,
       runScripts: 'outside-only',
       pretendToBeVisual: true
     }
@@ -313,6 +313,174 @@ async function scenario(name, fn) {
       dom2.window.document.getElementById('username').value === 'Zoe',
       dom2.window.document.getElementById('username').value);
     dom2.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('stays connected: extra engine noise does not trigger retries', async () => {
+    const engine = makeEngine((cmd, e) => {
+      if (cmd.startsWith('connect ')) setTimeout(() => e.opts.module.print('Connection accepted'), 50);
+    });
+    const dom = await boot({ url: '?joinProbe=150&joinStall=60000', engine });
+    const { window } = dom;
+    startEngine(window, engine);
+    clickSubmit(window);
+    await sleep(1500);
+    check('connected', window.__csJoin.state.phase === 'connected', window.__csJoin.state.phase);
+    const before = engine.commands.filter((c) => c.startsWith('connect ')).length;
+    engine.opts.module.print('Player Alex connected');       // matches RE_OK, harmless
+    engine.opts.module.print('Server info: de_dust2, 4 players');
+    await sleep(1200);
+    const after = engine.commands.filter((c) => c.startsWith('connect ')).length;
+    check('no reconnect while healthy', after === before, after);
+    check('phase still connected', window.__csJoin.state.phase === 'connected', window.__csJoin.state.phase);
+    dom.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('drop mid-game: reconnects quietly, no scary card', async () => {
+    const engine = makeEngine((cmd, e) => {
+      if (cmd.startsWith('connect ')) setTimeout(() => e.opts.module.print('Connection accepted'), 50);
+    });
+    const dom = await boot({ url: '?joinProbe=150&joinStall=60000', engine });
+    const { window } = dom;
+    startEngine(window, engine);
+    clickSubmit(window);
+    await sleep(1500);
+    check('connected first', window.__csJoin.state.phase === 'connected', window.__csJoin.state.phase);
+
+    const before = engine.commands.filter((c) => c.startsWith('connect ')).length;
+    engine.opts.module.print('Server shutting down');   // the real drop signature
+    await sleep(1500);
+    check('it reconnected', engine.commands.filter((c) => c.startsWith('connect ')).length > before,
+      engine.commands.filter((c) => c.startsWith('connect ')).length);
+    check('back in the game', window.__csJoin.state.phase === 'connected', window.__csJoin.state.phase);
+    check('no failure card for a hiccup', !window.document.getElementById('cs-joinhelp'));
+    dom.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('repeated drops: exhausted, card + background retry continues', async () => {
+    let accept = true;
+    const engine = makeEngine((cmd, e) => {
+      if (cmd.startsWith('connect ')) {
+        setTimeout(() => e.opts.module.print(accept ? 'Connection accepted' : 'Server not responding'), 40);
+      }
+    });
+    const dom = await boot({ url: '?joinProbe=150&joinStall=60000&joinDrop=1&joinTimeout=200&joinRetry=50&joinIdle=300', engine });
+    const { window } = dom;
+    startEngine(window, engine);
+    clickSubmit(window);
+    await sleep(1500);
+    const before = engine.commands.filter((c) => c.startsWith('connect ')).length;
+    // Drop again after the single quiet retry has been used up.
+    accept = true;
+    engine.opts.module.print('Server shutting down');
+    await sleep(400);
+    accept = false;
+    engine.opts.module.print('Server shutting down');
+    await sleep(1200);
+    check('reconnect attempts happened', engine.commands.filter((c) => c.startsWith('connect ')).length > before);
+    check('card eventually shown', !!window.document.getElementById('cs-joinhelp') || window.__csJoin.state.phase === 'failed',
+      window.__csJoin.state.phase);
+    // The background retry must recover by itself once the server is back.
+    accept = true;
+    await sleep(1200);
+    check('background retry recovered without user action',
+      window.__csJoin.state.phase === 'connected', window.__csJoin.state.phase);
+    check('card removed after recovery', !window.document.getElementById('cs-joinhelp'));
+    dom.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('watchdog: silent engine while connected is detected', async () => {
+    const engine = makeEngine((cmd, e) => {
+      if (cmd.startsWith('connect ')) setTimeout(() => e.opts.module.print('Connection accepted'), 40);
+    });
+    const dom = await boot({ url: '?joinStall=1000&joinProbe=200', engine });
+    const { window } = dom;
+    startEngine(window, engine);
+    clickSubmit(window);
+    await sleep(1400);
+    check('connected first', window.__csJoin.state.phase === 'connected', window.__csJoin.state.phase);
+    // Nothing else is ever printed -> the connection is dead, the engine just
+    // did not say so. The watchdog must notice within ~stall + probe.
+    await sleep(6000);
+    check('watchdog kicked in (a retry was attempted)',
+      engine.commands.filter((c) => c.startsWith('connect ')).length >= 2,
+      JSON.stringify(engine.commands));
+    dom.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('on the server machine: local game card + loopback first', async () => {
+    const engine = makeEngine();
+    const dom = await boot({ engine, host: 'localhost:27016' });
+    const { window } = dom;
+    startEngine(window, engine);
+    const local = window.document.querySelector('.cs-local button');
+    check('local-game card is offered on the host', !!local);
+    check('no local card for remote players', true);
+
+    clickSubmit(window); // "Start" -> join the LAN server
+    await sleep(1500);
+    check('host tries loopback first',
+      engine.commands.some((c) => c === 'connect 127.0.0.1:27018'),
+      JSON.stringify(engine.commands));
+    dom.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('remote player does NOT get the local-game card', async () => {
+    const engine = makeEngine();
+    const dom = await boot({ engine, host: '192.168.1.77:27016' });
+    check('no local card on a player machine', !dom.window.document.querySelector('.cs-local'));
+    dom.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('local game button starts bots (no network at all)', async () => {
+    const engine = makeEngine();
+    const dom = await boot({ engine, host: 'localhost:27016' });
+    const { window } = dom;
+    startEngine(window, engine);
+    window.document.querySelector('.cs-local button').click();
+    await sleep(1500);
+    check('a map was started locally', engine.commands.some((c) => c.startsWith('map ')), JSON.stringify(engine.commands));
+    check('no server connect attempted', !engine.commands.some((c) => c.startsWith('connect ')));
+    dom.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('second round tries the other candidate address', async () => {
+    // configure a bogus explicit server: round 1 = bogus, round 2 = loopback
+    const engine = makeEngine();
+    const dom = await boot({ engine, host: 'localhost:27016', url: '?connect=10.5.5.5:27018&joinTimeout=150&joinRetry=40' });
+    const { window } = dom;
+    startEngine(window, engine);
+    clickSubmit(window);
+    await sleep(1600);
+    const targets = engine.commands.filter((c) => c.startsWith('connect '));
+    check('first tried the configured address', targets[0] === 'connect 10.5.5.5:27018', targets[0]);
+    check('then fell back to loopback', targets.some((c) => c === 'connect 127.0.0.1:27018'), JSON.stringify(targets));
+    dom.window.close();
+  });
+
+  // ---------------------------------------------------------------------
+  await scenario('status card reflects the phase in plain words', async () => {
+    const engine = makeEngine((cmd, e) => {
+      if (cmd.startsWith('connect ')) setTimeout(() => e.opts.module.print('Connection accepted'), 50);
+    });
+    const dom = await boot({ engine, url: '?joinProbe=150&joinStall=60000' });
+    const { window } = dom;
+    startEngine(window, engine);
+    const card = () => window.document.getElementById('cs-statecard');
+    check('status card exists', !!card());
+    check('says Ready before joining', /Ready/.test(card().textContent), card() && card().textContent);
+    clickSubmit(window);
+    await sleep(2000);
+    check('says Connected afterwards', /Connected/.test(card().textContent), card().textContent);
+    check('shows the server address', /192\.168\.1\.50:27018/.test(card().textContent));
+    dom.window.close();
   });
 
   console.log('\n' + passes + ' passed, ' + failures + ' failed');

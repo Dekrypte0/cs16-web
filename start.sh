@@ -32,12 +32,27 @@ copy_clip() {
   else return 1; fi
 }
 
+if ! command -v docker >/dev/null 2>&1; then
+  echo "✗ docker was not found on this machine."
+  echo "  Install Docker Desktop (macOS/Windows) or docker-ce (Linux), then re-run ./start.sh."
+  exit 1
+fi
+
 if ! docker info >/dev/null 2>&1; then
   case "$(uname -s)" in
     Darwin) echo "Starting Docker Desktop..."; open -a Docker ;;
     *) echo "Docker isn't running. Start it (Docker Desktop, or 'sudo systemctl start docker'), then re-run ./start.sh"; exit 1 ;;
   esac
-  until docker info >/dev/null 2>&1; do sleep 2; done
+  # Docker Desktop can take a while to come up on a cold machine.
+  DOCKER_WAIT=0
+  until docker info >/dev/null 2>&1; do
+    sleep 2
+    DOCKER_WAIT=$((DOCKER_WAIT + 2))
+    if [ "$DOCKER_WAIT" -ge 180 ]; then
+      echo "✗ Docker did not become ready within 3 minutes. Open Docker Desktop, then re-run ./start.sh."
+      exit 1
+    fi
+  done
 fi
 
 # First run (or after a failed/missing extraction): build the patched in-browser
@@ -187,4 +202,32 @@ echo "  Not connecting / landing on the CS main menu? Open"
 echo "      $URL/?debug=1"
 echo "  for an on-screen connection log, or press F8 in-game."
 echo ""
-echo "  Stop the server: ./stop.sh"
+
+# --- watchdog: keep the stack alive while nobody is watching ----------------
+# This is what makes a long session safe: if the page stops answering for ~1
+# minute, the containers are brought back (and the browser's own join layer
+# reconnects on its own). Stop it with ./stop.sh.
+if [ -f ./watchdog.sh ]; then
+  [ -x ./watchdog.sh ] || chmod +x ./watchdog.sh 2>/dev/null || true
+  WATCHDOG_CMD=./watchdog.sh
+  [ -x ./watchdog.sh ] || WATCHDOG_CMD="bash ./watchdog.sh"
+  # Detached on purpose (setsid/nohup + &): the watchdog is a long-running
+  # loop — running it in the foreground here would block ./start.sh forever.
+  # Detaching also means closing this terminal (or an SSH session) does not
+  # take the auto-recovery down with it.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup $WATCHDOG_CMD >/dev/null 2>&1 &
+  else
+    nohup $WATCHDOG_CMD >/dev/null 2>&1 &
+  fi
+  disown 2>/dev/null || true
+  sleep 1
+  if [ -f .watchdog.pid ] && kill -0 "$(cat .watchdog.pid 2>/dev/null || echo 0)" 2>/dev/null; then
+    echo "  Watchdog running — auto-recovers the server (log: watchdog.log)"
+  else
+    echo "  (watchdog did not start — run ./watchdog.sh manually for auto-recovery)"
+  fi
+fi
+echo ""
+echo "  Status:  ./status.sh"
+echo "  Stop:    ./stop.sh"
